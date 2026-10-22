@@ -9,16 +9,22 @@
 
 from __future__ import annotations
 
+import contextlib
+
 # Let's make some noise
 import json
 import os
+import queue
 import random
+import shutil
 import socket
 import subprocess
 import tempfile
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
+from pathlib import Path
 from typing import (  # noqa: UP035 — List avoids shadowing by @property list
     Any,
     List,
@@ -29,10 +35,12 @@ from . import logger
 from .api import NetEase
 from .cache import Cache
 from .config import Config
-from .kill_thread import stop_thread
 from .storage import Storage
 from .ui import Ui
 from .utils import notify
+
+if os.name == "nt":
+    from . import windows_mpg123, windows_mpv
 
 log = logger.getLogger(__name__)
 
@@ -67,6 +75,9 @@ class Player:
         self.current_backend = ""
         self.mpv_ipc_path = ""
         self.playback_token = 0
+        self._playback_lock = threading.RLock()
+        self.playback_error = None
+        self.playback_state = "stopped"
         # flag stop, prevent thread start
         self.playing_flag = False
         self.refresh_url_flag = False
@@ -183,7 +194,10 @@ class Player:
         self.info["playing_mode"] = (self.info["playing_mode"] + step) % 5
 
     def build_playinfo(self):
+        if threading.current_thread() is not threading.main_thread():
+            return
         if not self.current_song:
+            self.ui.build_playinfo("", "", "", "", 0, pause=True)
             return
 
         quality = self.current_song["quality"]
@@ -197,6 +211,7 @@ class Player:
             quality,
             self.playinfo_starts,
             pause=not self.playing_flag,
+            state=getattr(self, "playback_state", None),
         )
 
     def add_songs(self, songs):
@@ -243,77 +258,68 @@ class Player:
             return
         self.replay()
 
-    def stop(self):
-        if (
-            not hasattr(self.popen_handler, "poll")
-            or self.popen_handler.poll() is not None
-        ):
+    @staticmethod
+    def _reap_process(process):
+        if process is None:
             return
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2)
+        for name in ("stdin", "stdout", "stderr"):
+            stream = getattr(process, name, None)
+            if stream is not None:
+                with contextlib.suppress(OSError, ValueError):
+                    stream.close()
 
-        self.playback_token += 1
-        self.playing_flag = False
-        try:
-            if (
-                self.current_backend == "mpg123"
-                and self.popen_handler.poll() is None
-                and self.popen_handler.stdin
-                and not self.popen_handler.stdin.closed
-            ):
-                self.popen_handler.stdin.write(b"Q\n")
-                self.popen_handler.stdin.flush()
-                self.popen_handler.communicate()
-                self.popen_handler.kill()
-            elif self.popen_handler.poll() is None:
-                self.popen_handler.terminate()
-                try:
-                    self.popen_handler.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    self.popen_handler.kill()
-        except Exception as e:
-            log.warn(e)
-        finally:
-            for thread_i in range(0, len(self.MUSIC_THREADS) - 1):
-                if self.MUSIC_THREADS[thread_i].is_alive():
-                    try:
-                        stop_thread(self.MUSIC_THREADS[thread_i])
-                    except Exception as e:
-                        log.warn(e)
-                        pass
+    def stop(self):
+        with getattr(self, "_playback_lock", contextlib.nullcontext()):
+            self.playback_token = getattr(self, "playback_token", 0) + 1
+            self.playing_flag = False
+            self.process_location = self.process_length = 0
+            self.playback_state = "stopped"
+            process = self.popen_handler
+            if process is not None and process.poll() is None:
+                if (
+                    self.current_backend == "mpg123"
+                    and process.stdin
+                    and not process.stdin.closed
+                ):
+                    with contextlib.suppress(OSError, ValueError):
+                        process.stdin.write(b"Q\n")
+                        process.stdin.flush()
+                    with contextlib.suppress(subprocess.TimeoutExpired):
+                        process.wait(timeout=2)
+                self._reap_process(process)
+            if os.name == "nt":
+                self._close_mpg123_pipe()
+
+    def _close_mpg123_pipe(self):
+        stream = getattr(self, "mpg123_command_stream", None)
+        if stream is not None:
+            stream.close()
+            self.mpg123_command_stream = None
 
     def tune_volume(self, up=0):
-        new_volume = self.info["playing_volume"] + up
-        if new_volume < 0:
-            new_volume = 0
-        self.info["playing_volume"] = new_volume
-        if not self.popen_handler:
-            return
-        try:
-            if self.popen_handler.poll() is not None:
-                return
-        except Exception as e:
-            log.warn("Unable to tune volume: " + str(e))
-            return
-        if self.current_backend == "mpv":
-            self._send_mpv_command(["set_property", "volume", new_volume])
-            return
-        try:
-            self.popen_handler.stdin.write(f"V {new_volume}\n".encode())
-            self.popen_handler.stdin.flush()
-        except Exception as e:
-            log.warn(e)
+        self.set_volume(self.info["playing_volume"] + up)
 
     def set_volume(self, volume):
         """Set absolute volume (0-100+). Persists to storage even when stopped."""
         volume = max(0, int(volume))
-        self.info["playing_volume"] = volume
         if not self.popen_handler or self.popen_handler.poll() is not None:
+            self.info["playing_volume"] = volume
             return
         if self.current_backend == "mpv":
-            self._send_mpv_command(["set_property", "volume", volume])
+            if self._send_mpv_command(["set_property", "volume", volume]):
+                self.info["playing_volume"] = volume
             return
         try:
             self.popen_handler.stdin.write(f"V {volume}\n".encode())
             self.popen_handler.stdin.flush()
+            self.info["playing_volume"] = volume
         except Exception as e:
             log.warn(e)
 
@@ -323,8 +329,10 @@ class Player:
         if self.popen_handler.poll() is not None:
             return
         if self.current_backend == "mpv":
+            if not self._send_mpv_command(["set_property", "pause", self.playing_flag]):
+                return False
             self.playing_flag = not self.playing_flag
-            self._send_mpv_command(["set_property", "pause", not self.playing_flag])
+            self.playback_state = "playing" if self.playing_flag else "paused"
             self.playinfo_starts = time.time()
             self.build_playinfo()
             return
@@ -357,11 +365,32 @@ class Player:
         backend = str(self.config.get("player_backend") or "mpg123").lower()
         if backend == "mpv" or self._is_flac_song(song, url):
             return "mpv"
+        if (
+            os.name == "nt"
+            and not self.config_mpg123
+            and self._backend_executable("mpv")
+        ):
+            # Native mpg123 1.33.x buffers remote feedback for several seconds.
+            # Keep explicit mpg123 options; empty Windows defaults use real mpv IPC.
+            return "mpv"
         return "mpg123"
 
+    @staticmethod
+    def _backend_executable(name):
+        executable = shutil.which(name + ".exe" if os.name == "nt" else name)
+        if executable or os.name != "nt":
+            return executable
+        bundled = Path(__file__).resolve().parent.parent / name / (name + ".exe")
+        return str(bundled) if bundled.is_file() else None
+
     def _new_mpv_ipc_path(self):
+        if os.name == "nt":
+            return (
+                rf"\\.\pipe\musicbox-mpv-{os.getpid()}-{id(self)}-{self.playback_token}"
+            )
         return os.path.join(
-            tempfile.gettempdir(), f"musicbox-mpv-{os.getpid()}-{id(self)}.sock"
+            tempfile.gettempdir(),
+            f"musicbox-mpv-{os.getpid()}-{id(self)}-{self.playback_token}.sock",
         )
 
     def _cleanup_mpv_ipc(self, path=None):
@@ -369,7 +398,8 @@ class Player:
         if not path:
             return
         try:
-            os.unlink(path)
+            if os.name != "nt":
+                os.unlink(path)
         except FileNotFoundError:
             pass
         except OSError as e:
@@ -387,6 +417,8 @@ class Player:
         if not path:
             return False
         try:
+            if os.name == "nt":
+                return windows_mpv.command(path, command).get("error") == "success"
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
                 client.connect(path)
                 payload = json.dumps({"command": command}).encode() + b"\n"
@@ -401,6 +433,11 @@ class Player:
         if not path:
             return None
         try:
+            if os.name == "nt":
+                response = windows_mpv.command(path, ["get_property", name])
+                return (
+                    response.get("data") if response.get("error") == "success" else None
+                )
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
                 client.settimeout(0.2)
                 client.connect(path)
@@ -455,7 +492,7 @@ class Player:
         label = self._format_audio_params(
             self._request_mpv_property("audio-params", ipc_path)
         )
-        if not label:
+        if not label or not self._is_current_playback(token, process):
             return False
         song = self.current_song
         if not song:
@@ -463,211 +500,295 @@ class Player:
         song["audio_quality"] = label
         return True
 
-    def run_mpv(self, on_exit, url, expires=-1, get_time=-1, duration=0, token=0):
-        self.current_backend = "mpv"
-        if not url:
-            self.notify_copyright_issue()
-            self._advance_on_playback_failure()
-            return
+    @staticmethod
+    def _capture_diagnostics(process, stream=None):
+        diagnostics = deque(maxlen=32)
+        stream = process.stderr if stream is None else stream
 
-        self._cleanup_mpv_ipc()
-        ipc_path = self._new_mpv_ipc_path()
-        self.mpv_ipc_path = ipc_path
-        para = (
-            [
-                "mpv",
-                "--no-video",
-                "--really-quiet",
-                f"--input-ipc-server={ipc_path}",
-                f"--volume={self.info['playing_volume']}",
-            ]
-            + self.config_mpv
-            + [url]
-        )
-        try:
-            process = subprocess.Popen(
-                para,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+        def read():
+            if stream is None:
+                return
+            try:
+                for raw in iter(lambda: stream.readline(1024), b""):
+                    diagnostics.append(raw.decode("utf-8", errors="replace").lower())
+            except (OSError, ValueError):
+                return
+
+        thread = threading.Thread(target=read, daemon=True)
+        thread.start()
+        return diagnostics, thread
+
+    @staticmethod
+    def _audio_initialization_failed(diagnostics):
+        return any(
+            marker in line
+            for line in tuple(diagnostics)
+            for marker in (
+                "output format",
+                "audio output",
+                "audio_out",
+                "audio device",
+                "[ao",
+                "out123",
+                "driver module",
             )
-            self.popen_handler = process
-            self.process_length = max(int(duration or 0), 1)
-            self.process_location = 0
-            last_tick = time.time()
+        )
+
+    def _backend_failure(self, kind):
+        messages = {
+            "backend_unavailable": "本地播放器不可用，请检查 mpv / mpg123 安装路径",
+            "audio_initialization": "音频输出初始化失败，请检查播放器输出模块或设备",
+            "media_error": "音频加载或解码失败，请检查网络或音源可用性",
+        }
+        self.stop()
+        self.playback_error = {"kind": kind, "message": messages[kind]}
+        self.playback_state = "error"
+        # Backend diagnostics can contain signed URLs. Report only a bounded category.
+        log.warning(
+            "%s (backend=%s, song=%s)", kind, self.current_backend, self.playing_id
+        )
+        notify(messages[kind])
+
+    def run_mpv(self, on_exit, url, expires=-1, get_time=-1, duration=0, token=0):
+        if not url:
+            if self._is_current_playback(token):
+                self.notify_copyright_issue()
+                self._advance_on_playback_failure()
+            return
+        process = None
+        ipc_path = ""
+        diagnostics = deque(maxlen=32)
+        reader = None
+        try:
+            with getattr(self, "_playback_lock", contextlib.nullcontext()):
+                if not self._is_current_playback(token):
+                    return
+                self.current_backend = "mpv"
+                ipc_path = self._new_mpv_ipc_path()
+                self.mpv_ipc_path = ipc_path
+                para = [
+                    self._backend_executable("mpv") or "mpv",
+                    "--no-video",
+                    "--really-quiet",
+                    "--msg-level=all=warn",
+                    f"--input-ipc-server={ipc_path}",
+                    f"--volume={self.info['playing_volume']}",
+                    *self.config_mpv,
+                    url,
+                ]
+                process = subprocess.Popen(
+                    para,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                )
+                self.popen_handler = process
+                self.process_location = self.process_length = 0
+            diagnostics, reader = self._capture_diagnostics(process, process.stdout)
             audio_info_loaded = False
             while process.poll() is None:
-                now = time.time()
-                is_current = self._is_current_playback(token, process)
-                if self.playing_flag and is_current:
-                    self.process_location = min(
-                        self.process_location + now - last_tick,
-                        self.process_length,
+                with getattr(self, "_playback_lock", contextlib.nullcontext()):
+                    if not self._is_current_playback(token, process):
+                        return
+                    position = self._request_mpv_property("time-pos", ipc_path)
+                    length = self._request_mpv_property("duration", ipc_path)
+                    paused = self._request_mpv_property("pause", ipc_path)
+                    buffering = self._request_mpv_property("paused-for-cache", ipc_path)
+                    if not self._is_current_playback(token, process):
+                        return
+                    if isinstance(position, (int, float)):
+                        self.process_location = max(0, position)
+                    self.process_length = (
+                        max(0, length) if isinstance(length, (int, float)) else 0
+                    )
+                    if isinstance(paused, bool):
+                        self.playing_flag = not paused
+                    self.playback_state = (
+                        "paused"
+                        if paused
+                        else "buffering"
+                        if buffering
+                        else "loading"
+                        if position is None
+                        else "playing"
                     )
                     if not audio_info_loaded:
                         audio_info_loaded = self._refresh_mpv_audio_info(
                             ipc_path, token, process
                         )
-                last_tick = now
                 time.sleep(0.2)
-        except OSError as e:
-            log.error(e)
-            notify("mpv 不可用，无法播放无损音频")
-            self.playing_flag = False
-            self._cleanup_mpv_ipc(ipc_path)
-            return
-        self._cleanup_mpv_ipc(ipc_path)
-
-        if not self.playing_flag or not self._is_current_playback(token, process):
-            return
-        if process.returncode == 0:
-            self.next()
-            return
-        if expires >= 0 and get_time >= 0 and time.time() - expires - get_time >= 0:
-            self.refresh_urls()
-            if self.refresh_url_flag:
-                self.stop()
-                self.playing_flag = True
-                self.start_playing(lambda: 0, self.current_song)
-                self.refresh_url_flag = False
-            else:
-                self.notify_copyright_issue()
-                self._advance_on_playback_failure()
-            return
-        self.notify_copyright_issue()
-        self._advance_on_playback_failure()
-
-    def run_mpg123(self, on_exit, url, expires=-1, get_time=-1):
-        self.current_backend = "mpg123"
-        para = ["mpg123", "-R"] + self.config_mpg123
-        self.popen_handler = subprocess.Popen(
-            para, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
-
-        if not url:
-            self.notify_copyright_issue()
-            self._advance_on_playback_failure()
-            return
-
-        self.tune_volume()
-        try:
-            self.popen_handler.stdin.write(b"L " + url.encode("utf-8") + b"\n")
-            self.popen_handler.stdin.flush()
-        except Exception:
-            pass
-
-        strout = " "
-        copyright_issue_flag = False
-        frame_cnt = 0
-        while True:
-            # Check the handler/stdin/stdout
-            if not hasattr(self.popen_handler, "poll") or self.popen_handler.poll():
-                break
-            if self.popen_handler.stdout.closed:
-                break
-
-            # try to read the stdout of mpg123
-            try:
-                stroutlines = self.popen_handler.stdout.readline()
-            except Exception as e:
-                log.warn(e)
-                break
-            if not stroutlines:
-                strout = " "
-                break
-            else:
-                strout_new = stroutlines.decode().strip()
-                if strout_new[:2] != strout[:2]:
-                    # if status of mpg123 changed
-                    for thread_i in range(0, len(self.MUSIC_THREADS) - 1):
-                        if self.MUSIC_THREADS[thread_i].is_alive():
-                            try:
-                                stop_thread(self.MUSIC_THREADS[thread_i])
-                            except Exception as e:
-                                log.warn(e)
-
-                strout = strout_new
-
-            # Update application status according to mpg123 output
-            if strout[:2] == "@F":
-                # playing, update progress
-                out = strout.split(" ")
-                frame_cnt += 1
-                self.process_location = float(out[3])
-                self.process_length = int(float(out[3]) + float(out[4]))
-            elif strout[:2] == "@E":
-                self.playing_flag = True
-                if (
-                    expires >= 0
-                    and get_time >= 0
-                    and time.time() - expires - get_time >= 0
+            if reader:
+                reader.join(timeout=0.3)
+            with getattr(self, "_playback_lock", contextlib.nullcontext()):
+                if not self._is_current_playback(token, process):
+                    return
+                if process.returncode == 0:
+                    self.next()
+                elif self._audio_initialization_failed(diagnostics):
+                    self._backend_failure("audio_initialization")
+                elif (
+                    expires >= 0 and get_time >= 0 and time.time() >= expires + get_time
                 ):
-                    # 刷新URL，设 self.refresh_url_flag = True
                     self.refresh_urls()
+                    if self.refresh_url_flag:
+                        self.stop()
+                        self.playing_flag = True
+                        self.start_playing(lambda: 0, self.current_song)
+                        self.refresh_url_flag = False
+                    else:
+                        self._backend_failure("media_error")
                 else:
-                    # copyright issue raised, next if not single loop
-                    copyright_issue_flag = True
-                    self.notify_copyright_issue()
-                break
-            elif strout == "@P 0" and frame_cnt:
-                # normally end, moving to next
-                self.playing_flag = True
-                copyright_issue_flag = False
-                break
-            elif strout == "@P 0":
-                # copyright issue raised, next if not single loop
-                self.playing_flag = True
-                copyright_issue_flag = True
+                    self._backend_failure("media_error")
+        except OSError:
+            if self._is_current_playback(token):
+                self._backend_failure("backend_unavailable")
+        finally:
+            self._reap_process(process)
+            if reader:
+                reader.join(timeout=0.3)
+            self._cleanup_mpv_ipc(ipc_path)
+
+    def run_mpg123(self, on_exit, url, expires=-1, get_time=-1, token=None):
+        token = self.playback_token if token is None else token
+        process = commands = None
+        diagnostics = deque(maxlen=32)
+        reader = None
+        try:
+            if not self._is_current_playback(token):
+                return
+            if not url:
                 self.notify_copyright_issue()
-                break
-
-        # Ideal behavior:
-        # if refresh_url_flag are set, then replay.
-        # if not, do action like following:
-        #   [self.playing_flag, copyright_issue_flag, self.is_single_loop_mode]: function()
-        #       [0, 0, 0]: self.stop()
-        #       [0, 0, 1]: self.stop()
-        #       [0, 1, 0]: self.stop()
-        #       [0, 1, 1]: self.stop()
-        #       [1, 0, 0]: self.next()
-        #       [1, 0, 1]: self.next()
-        #       [1, 1, 0]: self.next()
-        #       [1, 1, 1]: self.stop()
-
-        # Do corresponding action according to status
-        if self.playing_flag and self.refresh_url_flag:
-            self.stop()  # Will set self.playing_flag = False
-            # So set the playing_flag here to be True is necessary
-            # to keep the play/pause status right
-            self.playing_flag = True
-            self.start_playing(lambda: 0, self.current_song)
-            self.refresh_url_flag = False
-        else:
-            if not self.playing_flag:
-                self.stop()
-            elif copyright_issue_flag:
                 self._advance_on_playback_failure()
-            elif frame_cnt == 0:
-                self.stop()
-                self.playing_flag = False
-            else:
-                self.next()
+                return
+            executable = self._backend_executable("mpg123") or "mpg123"
+            parameters = self.config_mpg123
+            if os.name == "nt":
+                parameters = windows_mpg123.output_parameters(executable, parameters)
+            para = [executable, "-R", *parameters]
+            command_path = rf"\\.\pipe\musicbox-mpg123-{os.getpid()}-{id(self)}-{token}"
+            if os.name == "nt":
+                para += ["--fifo", command_path]
+            with getattr(self, "_playback_lock", contextlib.nullcontext()):
+                if not self._is_current_playback(token):
+                    return
+                self.current_backend = "mpg123"
+                process = subprocess.Popen(
+                    para,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                )
+                self.popen_handler = process
+            diagnostics, reader = self._capture_diagnostics(process)
+            assert process.stdin is not None and process.stdout is not None
+            protocol_output = process.stdout
+            if os.name == "nt":
+                commands = windows_mpg123.open_commands(process, command_path)
+                with getattr(self, "_playback_lock", contextlib.nullcontext()):
+                    if not self._is_current_playback(token, process):
+                        return
+                    process.stdin.close()
+                    process.stdin = commands
+                    self.mpg123_command_stream = commands
+            lines = queue.Queue()
+
+            def read_protocol():
+                try:
+                    for raw in iter(protocol_output.readline, b""):
+                        lines.put(raw.decode("utf-8", errors="replace").strip())
+                except (OSError, ValueError):
+                    pass
+                finally:
+                    lines.put(None)
+
+            threading.Thread(target=read_protocol, daemon=True).start()
+            self.tune_volume()
+            process.stdin.write(b"L " + url.encode("utf-8") + b"\n")
+            process.stdin.flush()
+            frames = 0
+            finished = False
+            while self._is_current_playback(token, process):
+                if self._audio_initialization_failed(diagnostics):
+                    self._backend_failure("audio_initialization")
+                    return
+                try:
+                    line = lines.get(timeout=0.1)
+                except queue.Empty:
+                    if process.poll() is not None:
+                        break
+                    continue
+                if line is None:
+                    break
+                if line.startswith("@F "):
+                    parts = line.split()
+                    with getattr(self, "_playback_lock", contextlib.nullcontext()):
+                        if not self._is_current_playback(token, process):
+                            return
+                        self.process_location = float(parts[3])
+                        self.process_length = float(parts[3]) + float(parts[4])
+                        frames += 1
+                elif line == "@P 1":
+                    self.playback_state = "paused"
+                    self.playing_flag = False
+                elif line == "@P 2":
+                    self.playback_state = "playing"
+                    self.playing_flag = True
+                elif line == "@P 0":
+                    finished = frames > 0
+                    break
+                elif line.startswith("@E"):
+                    break
+            with getattr(self, "_playback_lock", contextlib.nullcontext()):
+                if not self._is_current_playback(token, process):
+                    return
+                if finished:
+                    self.next()
+                elif self._audio_initialization_failed(diagnostics):
+                    self._backend_failure("audio_initialization")
+                elif (
+                    expires >= 0 and get_time >= 0 and time.time() >= expires + get_time
+                ):
+                    self.refresh_urls()
+                    if self.refresh_url_flag:
+                        self.stop()
+                        self.playing_flag = True
+                        self.start_playing(lambda: 0, self.current_song)
+                        self.refresh_url_flag = False
+                    else:
+                        self._backend_failure("media_error")
+                else:
+                    self._backend_failure("media_error")
+        except (OSError, ValueError):
+            if self._is_current_playback(token):
+                self._backend_failure(
+                    "audio_initialization"
+                    if self._audio_initialization_failed(diagnostics)
+                    else "backend_unavailable"
+                )
+        finally:
+            self._reap_process(process)
+            if reader:
+                reader.join(timeout=0.3)
+            if commands is not None:
+                commands.close()
+                if getattr(self, "mpg123_command_stream", None) is commands:
+                    self.mpg123_command_stream = None
 
     def download_lyric(self, is_transalted=False):
         key = "lyric" if not is_transalted else "tlyric"
-
-        if key not in self.songs[str(self.playing_id)]:
-            self.songs[str(self.playing_id)][key] = []
-
-        if len(self.songs[str(self.playing_id)][key]) > 0:
+        song_id = str(self.playing_id)
+        token = self.playback_token
+        song = self.songs.get(song_id)
+        if song is None or song.get(key):
             return
-
         if not is_transalted:
-            lyric = self.api.song_lyric(self.playing_id)
+            lyric = self.api.song_lyric(song["song_id"])
         else:
-            lyric = self.api.song_tlyric(self.playing_id)
-
-        self.songs[str(self.playing_id)][key] = lyric
+            lyric = self.api.song_tlyric(song["song_id"])
+        if token == self.playback_token and str(self.playing_id) == song_id:
+            song[key] = lyric
 
     def download_song(self, song_id, song_name, artist, url, song_type="", level=""):
         def write_path(song_id, path):
@@ -693,6 +814,9 @@ class Player:
         runner = self.run_mpv if backend == "mpv" else self.run_mpg123
         self.playback_token += 1
         token = self.playback_token
+        self.process_location = self.process_length = 0
+        self.playback_error = None
+        self.playback_state = "loading"
         if "cache" in args and os.path.isfile(args["cache"]):
             if backend == "mpv":
                 thread = threading.Thread(
@@ -707,11 +831,15 @@ class Player:
                     ),
                 )
             else:
-                thread = threading.Thread(target=runner, args=(on_exit, args["cache"]))
+                thread = threading.Thread(
+                    target=runner, args=(on_exit, args["cache"], -1, -1, token)
+                )
         else:
             player_args = (on_exit, args["mp3_url"], args["expires"], args["get_time"])
             if backend == "mpv":
                 player_args = (*player_args, args.get("duration", 0), token)
+            else:
+                player_args = (*player_args, token)
             thread = threading.Thread(
                 target=runner,
                 args=player_args,
@@ -728,13 +856,16 @@ class Player:
                 ),
             )
             cache_thread.start()
+        thread.daemon = True
         thread.start()
         self.MUSIC_THREADS.append(thread)
         self.MUSIC_THREADS = [i for i in self.MUSIC_THREADS if i.is_alive()]
-        lyric_download_thread = threading.Thread(target=self.download_lyric)
+        lyric_download_thread = threading.Thread(
+            target=self.download_lyric, daemon=True
+        )
         lyric_download_thread.start()
         tlyric_download_thread = threading.Thread(
-            target=self.download_lyric, args=(True,)
+            target=self.download_lyric, args=(True,), daemon=True
         )
         tlyric_download_thread.start()
         # returns immediately after the thread starts
@@ -783,7 +914,7 @@ class Player:
 
         # if same "list index" and "playing index" --> same song :: pause/resume it
         if self.index == idx and switch_flag:
-            if not self.popen_handler:
+            if not self.popen_handler or self.popen_handler.poll() is not None:
                 self.replay()
             else:
                 self.switch()
@@ -908,12 +1039,9 @@ class Player:
         mode = "relative" if relative else "absolute"
         if not self._send_mpv_command(["seek", position, mode]):
             return False
-        if relative:
-            self.process_location = max(
-                0, min(self.process_location + position, self.process_length)
-            )
-        else:
-            self.process_location = max(0, min(position, self.process_length))
+        actual = self._request_mpv_property("time-pos")
+        if isinstance(actual, (int, float)):
+            self.process_location = max(0, actual)
         return True
 
     def volume_up(self):

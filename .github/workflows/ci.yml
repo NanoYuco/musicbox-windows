@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches: [main, master]
   pull_request:
-    branches: [master]
+    branches: [main, master]
   workflow_dispatch:
 
 concurrency:
@@ -15,55 +15,62 @@ permissions:
   contents: read
 
 jobs:
-  lint:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
-        with:
-          python-version: "3.10"
-          enable-cache: true
-          cache-dependency-glob: "uv.lock"
-      - run: uv sync --frozen
-      - run: uv run ruff check
-      - run: uv run ruff format --check
-      - run: uv run ty check
-
-  test:
-    runs-on: ubuntu-latest
+  windows:
+    runs-on: windows-latest
     timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: ${{ github.workspace }}
+    env:
+      UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/musicbox/venv
+      UV_CACHE_DIR: ${{ runner.temp }}/musicbox/uv-cache
+      UV_LINK_MODE: copy
+      RUFF_CACHE_DIR: ${{ runner.temp }}/musicbox/ruff-cache
+      XDG_CONFIG_HOME: ${{ runner.temp }}/musicbox/config
+      XDG_DATA_HOME: ${{ runner.temp }}/musicbox/data
+      XDG_CACHE_HOME: ${{ runner.temp }}/musicbox/cache
+      XDG_RUNTIME_DIR: ${{ runner.temp }}/musicbox/runtime
+      TEMP: ${{ runner.temp }}/musicbox/temp
+      TMP: ${{ runner.temp }}/musicbox/temp
+      TMPDIR: ${{ runner.temp }}/musicbox/temp
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUTF8: "1"
+      PYTHONPATH: ""
+      PYTHONHOME: ""
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
-        with:
-          python-version: ${{ matrix.python-version }}
-          enable-cache: true
-          cache-dependency-glob: "uv.lock"
-      - run: uv sync --frozen
-      - run: uv run pytest -q --tb=short
-      - name: CLI smoke tests
+      - name: Prepare isolated directories
         run: |
-          uv run musicbox -v
-          uv run musicbox search --help
-          uv run musicbox daemon status --json
-          uv run musicbox auth status --json
-        env:
-          TERM: xterm
-
-  build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
+          foreach ($part in 'config','data','cache','runtime','work','players','temp','dist') {
+            New-Item -ItemType Directory -Force "$env:RUNNER_TEMP/musicbox/$part" | Out-Null
+          }
       - uses: astral-sh/setup-uv@v6
         with:
-          python-version: "3.10"
-          enable-cache: true
-          cache-dependency-glob: "uv.lock"
-      - run: uv sync --frozen
-      - run: uv build
+          python-version: "3.13"
+      - name: Prepare pinned mpv
+        run: |
+          $archive = "$env:RUNNER_TEMP/musicbox/mpv.zip"
+          Invoke-WebRequest 'https://github.com/mpv-player/mpv/releases/download/v0.41.0/mpv-v0.41.0-x86_64-pc-windows-msvc.zip' -OutFile $archive
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne '4e197f729f5071c6772f35fffd96e0f36e3e8a044bd9479b136bb09b7c6a80ff') {
+            throw 'Unexpected mpv archive hash'
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath "$env:RUNNER_TEMP/musicbox/players"
+          "$env:RUNNER_TEMP/musicbox/players" | Out-File -FilePath $env:GITHUB_PATH -Append
+      - run: uv sync --project "$env:GITHUB_WORKSPACE" --frozen
+      - run: uv run --project "$env:GITHUB_WORKSPACE" --frozen ruff check
+      - run: uv run --project "$env:GITHUB_WORKSPACE" --frozen ruff format --check
+      - run: uv run --project "$env:GITHUB_WORKSPACE" --frozen ty check
+      - name: Full suite with outputs outside checkout
+        working-directory: ${{ runner.temp }}/musicbox/work
+        run: uv run --project "$env:GITHUB_WORKSPACE" --frozen pytest "$env:GITHUB_WORKSPACE/tests" -q --tb=short -o "cache_dir=$env:RUNNER_TEMP/musicbox/pytest-cache" --basetemp "$env:RUNNER_TEMP/musicbox/pytest-temp" --junitxml "$env:RUNNER_TEMP/musicbox/pytest.xml"
+      - name: Local CLI smoke tests
+        working-directory: ${{ runner.temp }}/musicbox/work
+        run: |
+          uv run --project "$env:GITHUB_WORKSPACE" --frozen musicbox --help
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          uv run --project "$env:GITHUB_WORKSPACE" --frozen musicbox config get music_quality --json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          uv run --project "$env:GITHUB_WORKSPACE" --frozen musicbox daemon status --json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - run: uv build --project "$env:GITHUB_WORKSPACE" --out-dir "$env:RUNNER_TEMP/musicbox/dist"

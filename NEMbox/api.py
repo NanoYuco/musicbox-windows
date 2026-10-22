@@ -9,6 +9,8 @@ import json
 import os
 import random
 import time
+from copy import copy
+from email.utils import mktime_tz, parsedate_tz
 from http.cookiejar import Cookie, MozillaCookieJar
 from http.cookies import SimpleCookie
 from typing import Any, cast
@@ -340,7 +342,7 @@ class NetEase:
         }
         self.storage = Storage()
         self.cookie_jar = MozillaCookieJar(self.storage.cookie_path)
-        self.cookie_jar.load()
+        self._load_cookies()
         self.session = CachedSession(
             cache_name=Constant.cache_path,
             expire_after=3600,
@@ -379,9 +381,19 @@ class NetEase:
 
     def _get_cookie_value(self, name):
         for cookie in self.session.cookies:
-            if cookie.name == name:
+            if cookie.name == name and not cookie.is_expired():
                 return cookie.value
         return ""
+
+    def _load_cookies(self):
+        # Persist login sessions across CLI/TUI restarts without inventing expiry.
+        # Netscape files encode expires=None as a discarded session on reload.
+        self.cookie_jar.load(ignore_discard=True)
+
+    def _save_cookies(self):
+        # Reloaded sessions must survive every subsequent save too. Expired
+        # cookies remain excluded by MozillaCookieJar's default expiry policy.
+        self.cookie_jar.save(ignore_discard=True)
 
     def _set_cookie(self, name, value):
         self.session.cookies.set_cookie(self.make_cookie(name, value))
@@ -397,7 +409,28 @@ class NetEase:
             return
         for name, morsel in cookie.items():
             if morsel.value:
-                self._set_cookie(name, morsel.value)
+                item = self.make_cookie(name, morsel.value)
+                if morsel["domain"]:
+                    item.domain = morsel["domain"]
+                    item.domain_specified = True
+                    item.domain_initial_dot = item.domain.startswith(".")
+                if morsel["path"]:
+                    item.path = morsel["path"]
+                    item.path_specified = True
+                if morsel["secure"]:
+                    item.secure = True
+                date = parsedate_tz(morsel["expires"])
+                expires = mktime_tz(date) if date is not None else None
+                if morsel["max-age"]:
+                    try:
+                        expires = int(time.time()) + int(morsel["max-age"])
+                    except ValueError:
+                        log.warning("invalid login cookie Max-Age")
+                        continue
+                if expires is not None:
+                    item.expires = expires
+                    item.discard = False
+                self.session.cookies.set_cookie(item)
 
     def fetch_toplists(self):
         try:
@@ -440,7 +473,7 @@ class NetEase:
             "user_id": "",
             "nickname": "",
         }
-        self.cookie_jar.save()
+        self._save_cookies()
         self.storage.save()
 
     def _raw_request(self, method, endpoint, data=None):
@@ -457,6 +490,14 @@ class NetEase:
 
     # 生成Cookie对象
     def make_cookie(self, name, value):
+        # A QR response may repeat HTTP cookies as a bare name/value string.
+        # Keep the attributes already parsed from Set-Cookie instead of adding
+        # a second, less restricted cookie with the same name.
+        for existing in self.session.cookies:
+            if existing.name == name:
+                cookie = copy(existing)
+                cookie.value = value
+                return cookie
         return Cookie(
             version=0,
             name=name,
@@ -470,7 +511,7 @@ class NetEase:
             path_specified=True,
             secure=False,
             expires=None,
-            discard=False,
+            discard=True,
             comment=None,
             comment_url=None,
             rest={},
@@ -491,11 +532,7 @@ class NetEase:
         if params is None:
             params = {}
         endpoint = f"{BASE_URL}{path}"
-        csrf_token = ""
-        for cookie in self.session.cookies:
-            if cookie.name == "__csrf":
-                csrf_token = cookie.value
-                break
+        csrf_token = self._get_cookie_value("__csrf")
         params.update({"csrf_token": csrf_token})
         data = default
 
@@ -548,7 +585,7 @@ class NetEase:
         if had_nmtid or not self._get_cookie_value("NMTID"):
             return
         try:
-            self.cookie_jar.save()
+            self._save_cookies()
         except Exception as e:
             log.warning("failed to persist EAPI NMTID (%s)", type(e).__name__)
 
@@ -635,14 +672,14 @@ class NetEase:
         username = anonymous_username(self._device_id)
         path = "/weapi/register/anonimous"
         data = self.request("POST", path, {"username": username})
-        self.cookie_jar.save()
+        self._save_cookies()
         return data
 
     def login_qr_key(self):
         """获取二维码 unikey。返回 unikey 字符串或 None。"""
-        self.cookie_jar.load()
+        self._load_cookies()
         self._ensure_anon_cookies()
-        self.cookie_jar.save()
+        self._save_cookies()
         path = "/weapi/login/qrcode/unikey"
         data = self.request("POST", path, {"type": 3}) or {}
         nested = data.get("data")
@@ -661,14 +698,14 @@ class NetEase:
 
     def login_qr_check(self, unikey):
         """轮询扫码状态。code: 800 过期 / 801 待扫码 / 802 待确认 / 803 成功。"""
-        self.cookie_jar.load()
+        self._load_cookies()
         self._ensure_anon_cookies()
-        self.cookie_jar.save()
+        self._save_cookies()
         path = "/weapi/login/qrcode/client/login"
         data = self.request("POST", path, {"type": 3, "key": unikey})
         if data.get("code") == 803:
             self._apply_cookie_string(data.get("cookie"))
-            self.cookie_jar.save()
+            self._save_cookies()
         return data
 
     def get_account_info(self):

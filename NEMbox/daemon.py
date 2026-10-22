@@ -1,21 +1,29 @@
 """musicboxd: resident playback daemon (phase 2 of agent-cli-design.md).
 
-The daemon owns the single stateful ``Player`` and ``database.json`` for the
-whole machine. Control-type CLI commands talk to it over a Unix domain socket
-using newline-delimited JSON-RPC. A flock-based single-owner lock makes the
-daemon and the curses TUI mutually exclusive.
+The daemon owns the stateful ``Player`` in its user state domain. POSIX clients
+use a Unix socket; Windows clients use an authenticated loopback connection
+with per-user protected discovery. An OS file lock makes the daemon and the
+curses TUI mutually exclusive.
 """
 
 import contextlib
 import errno
-import fcntl
 import json
 import os
+import secrets
 import signal
 import socket
+import subprocess
 import sys
 import time
 from typing import Any
+
+if os.name == "nt":
+    import msvcrt
+
+    from . import windows_runtime
+else:
+    import fcntl
 
 from . import logger
 from .api import NetEase
@@ -62,7 +70,10 @@ def acquire_lock() -> int | None:
     _ensure_runtime_dir()
     fd = os.open(Constant.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if os.name == "nt":
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         os.close(fd)
         return None
@@ -75,12 +86,21 @@ def release_lock(fd: int | None) -> None:
     if fd is None:
         return
     with contextlib.suppress(Exception):
-        fcntl.flock(fd, fcntl.LOCK_UN)
+        if os.name == "nt":
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
 
 
 def is_daemon_running() -> bool:
     """True if a daemon is reachable on the socket."""
+    if os.name == "nt":
+        try:
+            return send_request("daemon.ping", timeout=1.0).get("ok") is True
+        except (OSError, ValueError, KeyError):
+            return False
     if not os.path.exists(Constant.socket_path):
         return False
     try:
@@ -106,9 +126,16 @@ def send_request(
         + b"\n"
     )
     try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        family = socket.AF_INET if os.name == "nt" else socket.AF_UNIX
+        address = Constant.socket_path
+        if os.name == "nt":
+            port, key = windows_runtime.read_endpoint(Constant.socket_path)
+            address = ("127.0.0.1", port)
+            nonce = secrets.token_hex(16)
+            payload = windows_runtime.pack(json.loads(payload), key, nonce)
+        with socket.socket(family, socket.SOCK_STREAM) as client:
             client.settimeout(timeout)
-            client.connect(Constant.socket_path)
+            client.connect(address)
             client.sendall(payload)
             data = b""
             while b"\n" not in data:
@@ -120,7 +147,10 @@ def send_request(
         raise ConnectionError("daemon not running") from exc
     if not data:
         raise ConnectionError("empty response from daemon")
-    return json.loads(data.split(b"\n", 1)[0].decode())
+    response = json.loads(data.split(b"\n", 1)[0].decode())
+    if os.name == "nt":
+        response, _ = windows_runtime.unpack(response, key, nonce)
+    return response
 
 
 class MusicboxDaemon:
@@ -133,6 +163,7 @@ class MusicboxDaemon:
         self._lock_fd: int | None = None
         self._server: socket.socket | None = None
         self._running = False
+        self._auth_key = b""
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -141,6 +172,20 @@ class MusicboxDaemon:
         return self._lock_fd is not None
 
     def _bind(self) -> None:
+        if os.name == "nt":
+            self._server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                self._server.bind(("127.0.0.1", 0))
+                self._server.listen(8)
+                self._auth_key = windows_runtime.write_endpoint(
+                    Constant.socket_path, self._server.getsockname()[1]
+                )
+            except OSError:
+                self._server.close()
+                release_lock(self._lock_fd)
+                self._lock_fd = None
+                raise
+            return
         with contextlib.suppress(FileNotFoundError):
             os.unlink(Constant.socket_path)
         self._server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -219,9 +264,21 @@ class MusicboxDaemon:
             return
         if not data:
             return
+        nonce = ""
+        if os.name == "nt":
+            try:
+                request, nonce = windows_runtime.unpack(
+                    json.loads(data.split(b"\n", 1)[0]), self._auth_key
+                )
+            except (ValueError, KeyError, TypeError):
+                return
         req_id: Any = None
         try:
-            req = json.loads(data.split(b"\n", 1)[0].decode())
+            req = (
+                request
+                if os.name == "nt"
+                else json.loads(data.split(b"\n", 1)[0].decode())
+            )
             req_id = req.get("id")
             method = req.get("method", "")
             params = req.get("params") or {}
@@ -245,7 +302,11 @@ class MusicboxDaemon:
                 "error": {"type": "internal_error", "message": str(exc)},
             }
         with contextlib.suppress(OSError):
-            conn.sendall(json.dumps(response, ensure_ascii=False).encode() + b"\n")
+            conn.sendall(
+                windows_runtime.pack(response, self._auth_key, nonce)
+                if os.name == "nt"
+                else json.dumps(response, ensure_ascii=False).encode() + b"\n"
+            )
 
     def _dispatch(self, method: str, params: dict[str, Any]) -> Any:
         handlers = {
@@ -290,7 +351,9 @@ class MusicboxDaemon:
         if p.is_empty or not p.is_index_valid:
             state = "stopped"
         elif alive:
-            state = "playing" if p.playing_flag else "paused"
+            state = getattr(
+                p, "playback_state", "playing" if p.playing_flag else "paused"
+            )
         else:
             state = "stopped"
         song_data: dict[str, Any] = {}
@@ -312,6 +375,7 @@ class MusicboxDaemon:
             "backend": p.current_backend,
             "queue_index": p.index,
             "queue_size": len(p.list),
+            "error": getattr(p, "playback_error", None),
         }
 
     def _load_songs(self, song_ids: list[int]) -> list[dict[str, Any]]:
@@ -513,20 +577,45 @@ def spawn_daemon(timeout: float = _READY_TIMEOUT) -> bool:
     if is_daemon_running():
         return True
     _ensure_runtime_dir()
-    pid = os.fork()
-    if pid == 0:
-        try:
-            _daemonize_and_serve()
-        finally:
-            os._exit(1)
-    # Parent: reap the first child (which exits right after the second fork).
-    with contextlib.suppress(OSError):
-        os.waitpid(pid, 0)
+    process = None
+    if os.name == "nt":
+        process = subprocess.Popen(
+            [sys.executable, "-m", "NEMbox.daemon"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            creationflags=subprocess.DETACHED_PROCESS
+            | subprocess.CREATE_NEW_PROCESS_GROUP,
+        )
+    else:
+        pid = os.fork()
+        if pid == 0:
+            try:
+                _daemonize_and_serve()
+            finally:
+                os._exit(1)
+        # Parent: reap the first child (which exits right after the second fork).
+        with contextlib.suppress(OSError):
+            os.waitpid(pid, 0)
     deadline = time.time() + timeout
     while time.time() < deadline:
         if is_daemon_running():
             return True
+        if process is not None and process.poll() is not None:
+            return False
         time.sleep(0.1)
+    if process is not None and process.poll() is None:
+        # The venv executable may be a Windows redirector: stop our whole startup tree.
+        subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+            check=False,
+        )
+        process.wait(timeout=5)
     return False
 
 

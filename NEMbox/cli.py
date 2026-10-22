@@ -220,6 +220,8 @@ def _on_login_success(api: NetEase, storage: Storage) -> dict[str, Any]:
     account = info.get("account") or {}
     profile = info.get("profile") or {}
     userid = account.get("id")
+    if not userid:
+        return {}
     nickname = profile.get("nickname") or ""
     storage.login(nickname, "", userid, nickname)
     storage.save()
@@ -462,6 +464,12 @@ def cmd_auth_login(api: NetEase, ctx: CliContext, args: argparse.Namespace) -> i
             storage = Storage()
             storage.load()
             user = _on_login_success(api, storage)
+            if not user:
+                return ctx.emit_err(
+                    "not_logged_in",
+                    "扫码已确认，但未能确认账号登录，请稍后重试",
+                    exit_code=EXIT_NOT_LOGGED_IN,
+                )
             data = {"status": status, "code": code, **user}
             return ctx.emit_ok(data, f"登录成功: {user['nickname']}")
         data = {"status": status, "code": code, "message": resp.get("message", "")}
@@ -761,11 +769,16 @@ def cmd_download(api: NetEase, ctx: CliContext, ns: argparse.Namespace) -> int:
             filename = filename.replace(ch, "_")
         filepath = os.path.join(dest, filename)
         try:
-            resp = requests.get(mp3_url, stream=True, timeout=30)
-            resp.raise_for_status()
-            with open(filepath, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=8192):
-                    f.write(chunk)
+            with requests.get(mp3_url, stream=True, timeout=30) as resp:
+                resp.raise_for_status()
+                media_type = (
+                    resp.headers.get("Content-Type", "").split(";", 1)[0].lower()
+                )
+                if media_type == "text/html":
+                    raise ValueError("服务器返回 HTML 页面，无法作为音频下载")
+                with open(filepath, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=8192):
+                        f.write(chunk)
             if ctx.json_mode:
                 results.append(
                     {

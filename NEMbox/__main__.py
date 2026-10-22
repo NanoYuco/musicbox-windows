@@ -20,7 +20,7 @@ def start():
 
     # TUI and daemon are mutually exclusive: both contend for the same flock.
     global _lock_fd
-    from .daemon import acquire_lock, is_daemon_running
+    from .daemon import acquire_lock, is_daemon_running, release_lock
 
     if is_daemon_running():
         print(
@@ -34,18 +34,27 @@ def start():
         print("无法获取 musicbox 运行锁，可能已有实例在运行。", file=sys.stderr)
         sys.exit(1)
 
-    nembox_menu = Menu()
+    nembox_menu = None
     try:
+        nembox_menu = Menu()
         nembox_menu.start_fork(__version__)
+    except KeyboardInterrupt:
+        pass
     except (OSError, TypeError, ValueError, KeyError, IndexError):
-        # clean up terminal while failed
-        try:
-            curses.echo()
-            curses.nocbreak()
-            curses.endwin()
-        except _curses.error:
-            pass
         traceback.print_exc()
+    finally:
+        try:
+            if nembox_menu is not None:
+                nembox_menu.stop()
+        finally:
+            try:
+                curses.echo()
+                curses.nocbreak()
+                curses.endwin()
+            except _curses.error:
+                pass
+            release_lock(_lock_fd)
+            _lock_fd = None
 
 
 if __name__ == "__main__":

@@ -1,50 +1,82 @@
-# Python
+# Python and generated packaging files
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
-
-# Packaging
 .Python
-build/
-dist/
+/build/
+/dist/
 *.egg-info/
 *.egg
 .eggs/
 *.manifest
 *.spec
 
-# Testing / lint
+# Test, lint and coverage caches (keep tests and fixtures)
 .pytest_cache/
-.coverage
-.coverage.*
-htmlcov/
-.hypothesis/
 .ruff_cache/
 .mypy_cache/
 .ty_cache/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+.poetry-cache/
+.uv-cache/
 
-# Environments
-.env
-.venv
+# Virtual environments and environment variables
+.venv/
 venv/
 env/
+/.env
+/.env.*
+/.envrc
 
-# IDE
-.vscode/
-.idea/
+# Locally installed audio backends and their personal configuration
+/mpv/
+/mpg123/
+/portable_config/
+/mpv.conf
+/input.conf
 
-# OS
-.DS_Store
-
-# HTTP session cache (runtime; canonical path is ~/.netease-musicbox/nemcache)
+# Runtime state; root rules leave formal tests and fixtures available
+/.netease-musicbox/
+/netease-musicbox/
+/config.json
+/database.json
+/cookie.txt
+/cookies.txt
+/cached/
+/nemcache*
 http_cache.sqlite
 nemcache.sqlite
+/*.sqlite
+/*.sqlite3
+/*.sqlite-*
+/*.sqlite3-*
+/*.db
+/*.db-*
+*.sock
+*.pid
+/*.log
 
-# Local dev scratch
-test_login.py
-.poetry-cache/
-# Logs
-*.log
+# Local editor, AI and planning material (keep skills/musicbox and uv.lock)
+.vscode/
+.idea/
+.agent/
+.agents/
+.cursor/
+.codex/
+.claude/
+AGENTS.md
+/evidence/
+/planning/
+/reports/
+/tmp/
+/temp/
+/test_login.py
 
-docs/
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini

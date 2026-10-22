@@ -10,16 +10,16 @@
 
 import contextlib
 import curses
-import datetime
 import importlib
 import os
 import re
-from shutil import get_terminal_size
+import unicodedata
+from collections.abc import Callable
 from typing import Any
 
 from . import logger
 from .config import Config
-from .scrollstring import scrollstring, truelen, truelen_cut
+from .scrollstring import _units, scrollstring, truelen, truelen_cut
 from .storage import Storage
 from .utils import decode_terminal_input
 
@@ -64,23 +64,13 @@ except ImportError:
 
 
 def break_substr(s, start, max_len=80):
-    if truelen(s) <= max_len:
-        return s
     res = []
-    current_truelen = 0
-    start_pos = 0
-    end_pos = 0
-    for c in s:
-        current_truelen += 2 if c > chr(127) else 1
-        if current_truelen > max_len:
-            res.append(s[start_pos:end_pos])
-            current_truelen = 0
-            start_pos = end_pos + 1
-            end_pos += 1
-        else:
-            end_pos += 1
-    with contextlib.suppress(Exception):
-        res.append(s[start_pos:end_pos])
+    while s:
+        line = truelen_cut(s, max_len)
+        if not line:
+            break
+        res.append(line)
+        s = s[len(line) :]
     return "\n{}".format(" " * start).join(res)
 
 
@@ -93,7 +83,17 @@ def break_str(s, start, max_len=80):
 
 class Ui:
     def __init__(self):
+        self.should_exit: Callable[[], bool] = lambda: False
         self.screen = curses.initscr()
+        self._single_cell_curses = False
+        if os.name == "nt":
+            probe = curses.newpad(1, 4)
+            probe.addstr(0, 0, "中")
+            self._single_cell_curses = probe.getyx()[1] == 1
+            if self._single_cell_curses:
+                from .windows_screen import WindowsScreen
+
+                self.screen = WindowsScreen(self.screen)
         curses.start_color()
         if Config().get("curses_transparency"):
             curses.use_default_colors()
@@ -120,9 +120,7 @@ class Ui:
                 curses.init_pair(4, curses.COLOR_YELLOW, curses.COLOR_BLACK)
         # term resize handling
         self.config = Config()
-        size = get_terminal_size()
-        self.x = size[0]
-        self.y = size[1]
+        self.y, self.x = self.screen.getmaxyx()
         self.playerX = 1  # terminalsize.get_terminal_size()[1] - 10
         self.playerY = 0
         self.update_margin()
@@ -138,12 +136,62 @@ class Ui:
 
     def addstr(self, *args):
         if len(args) == 1:
-            self.screen.addstr(args[0])
+            y, x = self.screen.getyx()
+            text, attributes = args[0], ()
         else:
-            try:
-                self.screen.addstr(args[0], args[1], args[2].encode("utf-8"), *args[3:])
-            except Exception as e:
-                log.error(e)
+            y, x, text, *attributes = args
+        rows, columns = self.screen.getmaxyx()
+        x = max(0, x)
+        if not 0 <= y < rows or x >= columns - 1:
+            return
+        # Curses must receive Unicode, and must never wrap at the right edge.
+        # Explicit multi-line comment bodies are laid out by their caller.
+        text = "".join(
+            c if c.isprintable() or c in "\u200d\ufe0f" else " " for c in str(text)
+        )
+        text = truelen_cut(unicodedata.normalize("NFC", text), columns - x - 1)
+        if text:
+            if getattr(self, "_single_cell_curses", False):
+                # Reserve layout cells for PDCurses' single-cell storage. The
+                # Windows output adapter omits these continuation cells when
+                # emitting Unicode, rather than adding visible spaces.
+                for unit in _units(text):
+                    width = truelen(unit)
+                    if not width:
+                        continue
+                    native_width = len(unit.encode("utf-16-le")) // 2
+                    if native_width > width:
+                        unit, native_width = "□", 1
+                    self.screen.addstr(
+                        y, x, unit + " " * (width - native_width), *attributes
+                    )
+                    x += width
+                self.screen.move(y, x)
+            else:
+                self.screen.addstr(y, x, text, *attributes)
+
+    def _clear_rows(self, first, last):
+        rows, _ = self.screen.getmaxyx()
+        for row in range(max(0, first), min(rows, last)):
+            self.screen.move(row, 0)
+            self.screen.clrtoeol()
+
+    def _small_window(self):
+        rows, columns = self.screen.getmaxyx()
+        return rows < 14 or columns < 40
+
+    def _show_small_window(self):
+        self.screen.erase()
+        self.addstr(0, 0, "窗口太小，请放大窗口")
+        self.screen.refresh()
+
+    def _read_key(self):
+        self.screen.timeout(100)
+        while not getattr(self, "should_exit", lambda: False)():
+            key = self.screen.getch()
+            if key != -1:
+                return key
+        return 27
 
     def update_margin(self):
         # Left margin
@@ -156,7 +204,7 @@ class Ui:
         # Right margin
         self.right_margin_ratio = self.config.get("right_margin_ratio")
         if self.right_margin_ratio == 0:
-            self.endcol = 0
+            self.endcol = self.x - 1
         else:
             self.endcol = max(
                 int(float(self.x) - float(self.x) / self.right_margin_ratio),
@@ -164,19 +212,21 @@ class Ui:
             )
 
         self.indented_endcol = max(self.endcol - 3, 0)
-        self.content_width = self.endcol - self.startcol - 1
+        self.endcol = min(self.endcol, self.x - 1)
+        self.content_width = max(0, self.endcol - self.startcol - 1)
 
     def build_playinfo(
-        self, song_name, artist, album_name, quality, start, pause=False
+        self, song_name, artist, album_name, quality, start, pause=False, state=None
     ):
         curses.noecho()
         _safe_curs_set(0)
         # refresh top 2 line
-        self.screen.move(1, 1)
-        self.screen.clrtoeol()
-        self.screen.move(2, 1)
-        self.screen.clrtoeol()
+        self._clear_rows(1, 3)
+        if self._small_window() or not song_name:
+            return
         prefix = "_ _ z Z Z " if pause else "♫  ♪ ♫  ♪ "
+        if state in {"stopped", "error"}:
+            prefix = "播放失败 " if state == "error" else "已停止 "
         self.addstr(1, self.indented_startcol, prefix + quality, curses.color_pair(3))
 
         if artist or album_name:
@@ -207,112 +257,79 @@ class Ui:
         self.screen.refresh()
 
     def update_lyrics(self, now_playing, lyrics, tlyrics):
-        timestap_regex = r"[0-5][0-9]:[0-5][0-9]\.[0-9]*"
+        timestamp = re.compile(r"\[([0-5][0-9]):([0-5][0-9])[.:]([0-9]+)\]")
 
-        def get_timestap(lyric_line):
-            match_ret = re.match(r"\[(" + timestap_regex + r")\]", lyric_line)
-            if match_ret:
-                return match_ret.group(1)
-            else:
-                return ""
-
-        def get_lyric_time(lyric_line):
-            lyric_timestap = get_timestap(lyric_line)
-            if lyric_timestap == "":
-                return datetime.timedelta(seconds=now_playing)
-            else:
+        def select_lines(lines, index):
+            timed = []
+            plain = []
+            for line in lines:
+                match = timestamp.match(line)
+                if match:
+                    minutes, seconds, fraction = match.groups()
+                    time = int(minutes) * 60 + int(seconds) + float("0." + fraction)
+                    timed.append((time, timestamp.sub("", line)))
+                elif line.strip() and not line.lstrip().startswith("["):
+                    plain.append(line)
+            # Untimed metadata, malformed tags and empty tail lines cannot
+            # claim the current playback time and advance a timed sequence.
+            if timed:
+                index = min(index, len(timed) - 1)
+                while (
+                    index + 1 < len(timed) and now_playing >= timed[index + 1][0] - 0.5
+                ):
+                    index += 1
                 return (
-                    datetime.datetime.strptime(get_timestap(lyric_line), "%M:%S.%f")
-                    - datetime.datetime.strptime("00:00", "%M:%S")
-                    - lyric_time_offset
+                    index,
+                    timed[index][1],
+                    (timed[index + 1][1] if index + 1 < len(timed) else ""),
                 )
-
-        def strip_timestap(lyric_line):
-            return re.sub(r"\[" + timestap_regex + r"\]", r"", lyric_line)
+            # Plain lyrics have no clock to advance them; keep them readable.
+            return 0, plain[0] if plain else "", plain[1] if len(plain) > 1 else ""
 
         def append_translation(translated_lyric, origin_lyric):
-            translated_lyric = strip_timestap(translated_lyric)
-            origin_lyric = strip_timestap(origin_lyric)
             if translated_lyric == "" or origin_lyric == "":
                 return translated_lyric + origin_lyric
             return translated_lyric + " || " + origin_lyric
 
-        if (
-            tlyrics and self.now_tlyric_index >= len(tlyrics) - 1
-        ) or self.now_lyric_index >= len(lyrics) - 1:
-            self.post_lyric = ""
-            return
-
-        lyric_time_offset = datetime.timedelta(seconds=0.5)
-        next_lyric_time = get_lyric_time(lyrics[self.now_lyric_index + 1])
-        # now_lyric_time = get_lyric_time(lyrics[self.now_lyric_index])
-        now_time = datetime.timedelta(seconds=now_playing)
-        while now_time >= next_lyric_time and self.now_lyric_index < len(lyrics) - 2:
-            self.now_lyric_index = self.now_lyric_index + 1
-            next_lyric_time = get_lyric_time(lyrics[self.now_lyric_index + 1])
-
+        self.now_lyric_index, self.now_lyric, self.post_lyric = select_lines(
+            lyrics, self.now_lyric_index
+        )
         if tlyrics:
-            next_tlyric_time = get_lyric_time(tlyrics[self.now_tlyric_index + 1])
-            while (
-                now_time >= next_tlyric_time
-                and self.now_tlyric_index < len(tlyrics) - 2
-            ):
-                self.now_tlyric_index = self.now_tlyric_index + 1
-                next_tlyric_time = get_lyric_time(tlyrics[self.now_tlyric_index + 1])
-
-        if tlyrics:
-            self.now_lyric = append_translation(
-                tlyrics[self.now_tlyric_index], lyrics[self.now_lyric_index]
+            self.now_tlyric_index, translated, next_translated = select_lines(
+                tlyrics, self.now_tlyric_index
             )
-            if (
-                self.now_tlyric_index < len(tlyrics) - 1
-                and self.now_lyric_index < len(lyrics) - 1
-            ):
-                self.post_lyric = append_translation(
-                    tlyrics[self.now_tlyric_index + 1], lyrics[self.now_lyric_index + 1]
-                )
-            else:
-                self.post_lyric = ""
-        else:
-            self.now_lyric = strip_timestap(lyrics[self.now_lyric_index])
-            if self.now_lyric_index < len(lyrics) - 1:
-                self.post_lyric = strip_timestap(lyrics[self.now_lyric_index + 1])
-            else:
-                self.post_lyric = ""
+            self.now_lyric = append_translation(translated, self.now_lyric)
+            self.post_lyric = append_translation(next_translated, self.post_lyric)
 
     def build_process_bar(
         self, song, now_playing, total_length, playing_flag, playing_mode
     ):
-        if not song or not playing_flag:
+        self._clear_rows(3, 7)
+        if not song or self._small_window():
+            self.now_lyric = self.post_lyric = ""
+            self.now_lyric_index = self.now_tlyric_index = 0
             return
         name, artist = song["song_name"], song["artist"]
         lyrics, tlyrics = song.get("lyric", []), song.get("tlyric", [])
 
         curses.noecho()
         _safe_curs_set(0)
-        self.screen.move(3, 1)
-        self.screen.clrtoeol()
-        self.screen.move(4, 1)
-        self.screen.clrtoeol()
-        self.screen.move(5, 1)
-        self.screen.clrtoeol()
-        self.screen.move(6, 1)
-        self.screen.clrtoeol()
-        if total_length <= 0:
-            total_length = 1
-        if now_playing > total_length or now_playing <= 0:
-            now_playing = 0
-        if int(now_playing) == 0:
+        now_playing = max(0, now_playing)
+        song_key = song.get("song_id", (name, artist))
+        if song_key != getattr(self, "_lyric_song", None) or now_playing < getattr(
+            self, "_lyric_position", 0
+        ):
             self.now_lyric_index = 0
-            if tlyrics:
-                self.now_tlyric_index = 0
+            self.now_tlyric_index = 0
             self.now_lyric = ""
             self.post_lyric = ""
+        self._lyric_song, self._lyric_position = song_key, now_playing
         process = "["
-        process_bar_width = self.content_width - 24
+        process_bar_width = max(0, self.content_width - 24)
+        ratio = min(now_playing / total_length, 1) if total_length > 0 else 0
         for i in range(0, process_bar_width):
-            progress = i < now_playing / total_length * process_bar_width
-            at_head = (i + 1) > now_playing / total_length * process_bar_width
+            progress = i < ratio * process_bar_width
+            at_head = (i + 1) > ratio * process_bar_width
             if progress and at_head and playing_flag:
                 process += ">"
             elif progress:
@@ -321,8 +338,12 @@ class Ui:
                 process += " "
         process += "] "
 
-        now = str(datetime.timedelta(seconds=int(now_playing))).lstrip("0").lstrip(":")
-        total = str(datetime.timedelta(seconds=total_length)).lstrip("0").lstrip(":")
+        now = f"{int(now_playing) // 60:02}:{int(now_playing) % 60:02}"
+        total = (
+            f"{int(total_length) // 60:02}:{int(total_length) % 60:02}"
+            if total_length > 0
+            else "--:--"
+        )
         process += f"({now}/{total})"
 
         if playing_mode == 0:
@@ -381,6 +402,7 @@ class Ui:
 
     def build_loading(self):
         _safe_curs_set(0)
+        self._clear_rows(7, 8)
         self.addstr(
             7, self.startcol, "享受高品质音乐，loading...", curses.color_pair(1)
         )
@@ -394,8 +416,12 @@ class Ui:
         # keep playing info in line 1
         curses.noecho()
         _safe_curs_set(0)
-        self.screen.move(7, 1)
+        if self._small_window():
+            self._show_small_window()
+            return
+        self.screen.move(7, 0)
         self.screen.clrtobot()
+        step = min(step, self.screen.getmaxyx()[0] - 10)
         self.addstr(7, self.startcol, title, curses.color_pair(1))
 
         if len(datalist) == 0:
@@ -506,16 +532,11 @@ class Ui:
                         + ":",
                         curses.color_pair(2),
                     )
-                    self.addstr(
-                        step + 12,
-                        self.startcol + (len(str(i)) + 2),
-                        break_str(
-                            datalist[i]["comment_content"].split(":", 1)[1][1:],
-                            self.startcol + (len(str(i)) + 2),
-                            maxlength,
-                        ),
-                        curses.color_pair(2),
-                    )
+                    body_col = self.startcol + len(str(i)) + 2
+                    body = datalist[i]["comment_content"].split(":", 1)[1].lstrip()
+                    body = break_str(body, 0, min(maxlength, self.x - body_col - 1))
+                    for row, line in enumerate(body.splitlines(), step + 12):
+                        self.addstr(row, body_col, line, curses.color_pair(2))
                 else:
                     self.addstr(
                         i - offset + 9,
@@ -730,7 +751,11 @@ class Ui:
 
         import qrcode
 
-        max_rows, _ = self.screen.getmaxyx()
+        if self._small_window():
+            self._show_small_window()
+            return 0
+
+        max_rows, max_columns = self.screen.getmaxyx()
         qr_start_row = 6
 
         qr = None
@@ -745,19 +770,18 @@ class Ui:
             candidate_lines = buf.getvalue().splitlines()
             qr_height = len(candidate_lines)
             candidate_status_row = qr_start_row + qr_height + 1
-            if candidate_status_row < max_rows:
+            if candidate_status_row < max_rows and all(
+                self.startcol + truelen(line) < max_columns for line in candidate_lines
+            ):
                 qr = candidate
                 lines = candidate_lines
                 status_row = candidate_status_row
                 break
         if qr is None:
-            qr = qrcode.QRCode(border=0)
-            qr.add_data(url)
-            qr.make(fit=True)
-            buf = io.StringIO()
-            qr.print_ascii(out=buf, invert=True)
-            lines = buf.getvalue().splitlines()
-            status_row = min(qr_start_row + len(lines), max_rows - 1)
+            self._clear_rows(3, max_rows)
+            self.addstr(4, 0, "窗口太小，无法完整显示二维码，请放大窗口")
+            self.screen.refresh()
+            return min(6, max_rows - 1)
 
         _safe_curs_set(0)
         curses.noecho()
@@ -790,6 +814,9 @@ class Ui:
         self.screen.refresh()
 
     def build_login_error(self):
+        if self._small_window():
+            self._show_small_window()
+            return 27
         _safe_curs_set(0)
         self.screen.move(4, 1)
         self.screen.timeout(-1)  # disable the screen timeout
@@ -801,11 +828,14 @@ class Ui:
         self.addstr(11, self.startcol, "[2] 稍后再试")
         self.addstr(14, self.startcol, "请键入对应数字:", curses.color_pair(2))
         self.screen.refresh()
-        x = self.screen.getch()
+        x = self._read_key()
         self.screen.timeout(100)  # restore the screen timeout
         return x
 
     def build_search_error(self):
+        if self._small_window():
+            self._show_small_window()
+            return 27
         _safe_curs_set(0)
         self.screen.move(4, 1)
         self.screen.timeout(-1)
@@ -818,7 +848,7 @@ class Ui:
             curses.color_pair(3),
         )
         self.screen.refresh()
-        x = self.screen.getch()
+        x = self._read_key()
         self.screen.timeout(100)
         return x
 
@@ -835,6 +865,10 @@ class Ui:
 
     def _read_line_input(self, y, x, max_len=60):
         """Read a line with UTF-8 aware backspace (get_wch), fallback to getstr."""
+        rows, columns = self.screen.getmaxyx()
+        if not 0 <= y < rows or not 0 <= x < columns - 1:
+            self._show_small_window()
+            return ""
         if not hasattr(self.screen, "get_wch"):
             raw = self.screen.getstr(y, x, max_len)
             return decode_terminal_input(raw)
@@ -843,12 +877,19 @@ class Ui:
         chars = []
         self.screen.move(y, x)
         self.screen.keypad(True)
+        self.screen.timeout(100)
 
         while True:
+            if getattr(self, "should_exit", lambda: False)():
+                return ""
             try:
                 ch = self.screen.get_wch()
             except curses.error:
                 ch = self.screen.getch()
+
+            rows, columns = self.screen.getmaxyx()
+            if not 0 <= y < rows or x + truelen("".join(chars)) >= columns:
+                return ""
 
             if _is_enter_key(ch):
                 break
@@ -863,15 +904,24 @@ class Ui:
             if isinstance(ch, str):
                 if len(ch) != 1 or ord(ch) < 32:
                     continue
-                if len(chars) >= max_len:
+                _, columns = self.screen.getmaxyx()
+                if (
+                    len(chars) >= max_len
+                    or truelen("".join(chars) + ch) > columns - x - 1
+                ):
                     continue
                 chars.append(ch)
-                with contextlib.suppress(curses.error):
-                    self.addstr(ch)
+                self.screen.move(y, x)
+                self.screen.clrtoeol()
+                self.addstr(y, x, "".join(chars))
+                self.screen.move(y, x + truelen("".join(chars)))
 
         return "".join(chars)
 
     def build_timing(self):
+        if self._small_window():
+            self._show_small_window()
+            return ""
         _safe_curs_set(0)
         self.screen.move(6, 1)
         self.screen.clrtobot()
@@ -890,6 +940,9 @@ class Ui:
         return timing_time
 
     def get_param(self, prompt_string):
+        if self._small_window():
+            self._show_small_window()
+            return ""
         # keep playing info in line 1
         curses.noecho()
         self.screen.move(4, 1)
@@ -904,15 +957,12 @@ class Ui:
     def update_size(self):
         _safe_curs_set(0)
         # get terminal size
-        size = get_terminal_size()
-        x = size[0]
-        y = size[1]
+        y, x = self.screen.getmaxyx()
         if (x, y) == (self.x, self.y):  # no need to resize
             return
         self.x, self.y = x, y
 
         # update intendations
-        curses.resizeterm(self.y, self.x)
         self.update_margin()
         self.update_space()
         self.screen.clear()

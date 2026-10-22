@@ -23,7 +23,12 @@ def test_mpv_switch_uses_ipc_pause_command():
     player.playing_flag = True
     player.build_playinfo = lambda: None
     commands = []
-    player._send_mpv_command = commands.append
+
+    def send(command):
+        commands.append(command)
+        return True
+
+    player._send_mpv_command = send
 
     player.switch()
     player.switch()

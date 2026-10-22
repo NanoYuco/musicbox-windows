@@ -75,7 +75,11 @@ def test_login_qr_key_uses_type_3_and_reads_nested_unikey(monkeypatch):
     monkeypatch.setattr(
         api,
         "cookie_jar",
-        type("Jar", (), {"load": lambda self: None, "save": lambda self: None})(),
+        type(
+            "Jar",
+            (),
+            {"load": lambda self, **kwargs: None, "save": lambda self, **kwargs: None},
+        )(),
         raising=False,
     )
     monkeypatch.setattr(api, "_ensure_anon_cookies", lambda: None)
@@ -104,8 +108,8 @@ def test_login_qr_check_uses_type_3_and_applies_cookie(monkeypatch):
             "Jar",
             (),
             {
-                "load": lambda self: None,
-                "save": lambda self: saved.append(True),
+                "load": lambda self, **kwargs: None,
+                "save": lambda self, **kwargs: saved.append(True),
             },
         )(),
         raising=False,
@@ -169,7 +173,7 @@ def test_eapi_request_sends_music_u_and_nmtid_in_payload_and_cookie(monkeypatch)
         return {"params": "encrypted"}
 
     api.session = Session()
-    api.cookie_jar = type("Jar", (), {"save": lambda self: None})()
+    api.cookie_jar = type("Jar", (), {"save": lambda self, **kwargs: None})()
     monkeypatch.setattr(api_module, "eapi_encrypt", fake_eapi_encrypt)
 
     assert api.eapi_request("/api/test", {"id": 1}) == {"code": 200}
@@ -211,7 +215,9 @@ def test_eapi_request_persists_first_nmtid(monkeypatch):
             return _JsonResponse()
 
     api.session = Session()
-    api.cookie_jar = type("Jar", (), {"save": lambda self: saved.append(True)})()
+    api.cookie_jar = type(
+        "Jar", (), {"save": lambda self, **kwargs: saved.append(True)}
+    )()
     monkeypatch.setattr(api_module, "eapi_encrypt", lambda path, payload: {})
 
     assert api.eapi_request("/api/test") == {"code": 200}
@@ -228,7 +234,9 @@ def test_eapi_request_does_not_resave_existing_nmtid(monkeypatch):
         (),
         {"post": lambda self, endpoint, data, headers, timeout: _JsonResponse()},
     )()
-    api.cookie_jar = type("Jar", (), {"save": lambda self: saved.append(True)})()
+    api.cookie_jar = type(
+        "Jar", (), {"save": lambda self, **kwargs: saved.append(True)}
+    )()
     monkeypatch.setattr(api_module, "eapi_encrypt", lambda path, payload: {})
 
     assert api.eapi_request("/api/test") == {"code": 200}
@@ -247,7 +255,7 @@ def test_eapi_request_ignores_nmtid_save_failure(monkeypatch):
             return _JsonResponse()
 
     class Jar:
-        def save(self):
+        def save(self, **kwargs):
             raise RuntimeError("secret-new-nmtid")
 
     api.session = Session()
@@ -341,7 +349,9 @@ def test_logout_calls_eapi_logout_before_clearing_local(monkeypatch):
             cleared.append(True)
 
     api.session.cookies = FakeCookies()
-    api.cookie_jar = type("Jar", (), {"save": lambda self: saved.append(True)})()
+    api.cookie_jar = type(
+        "Jar", (), {"save": lambda self, **kwargs: saved.append(True)}
+    )()
     api.storage = type(
         "Storage",
         (),

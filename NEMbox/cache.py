@@ -66,7 +66,12 @@ class Cache(Singleton):
     def _kill_all(self):
         def _kill(p):
             if p:
-                os.kill(p.pid, signal.SIGKILL)
+                if os.name == "nt":
+                    if p.poll() is None:
+                        p.kill()
+                    p.wait(timeout=5)
+                else:
+                    os.kill(p.pid, signal.SIGKILL)
 
         _kill(self.aria2c)
         _kill(self.wget)

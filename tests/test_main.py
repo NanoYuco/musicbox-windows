@@ -1,3 +1,4 @@
+import contextlib
 import sys
 
 import pytest
@@ -64,3 +65,33 @@ def test_tui_exits_1_when_lock_unavailable(monkeypatch, capsys):
 
     assert exc.value.code == 1
     assert "运行锁" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("failure", [None, KeyboardInterrupt, ValueError])
+def test_tui_releases_real_lock_after_exit_or_error(monkeypatch, failure):
+    from NEMbox import daemon as daemon_mod
+
+    class ExitMenu:
+        def start_fork(self, _version):
+            if failure:
+                raise failure()
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(sys, "argv", ["musicbox"])
+    monkeypatch.setattr(daemon_mod, "is_daemon_running", lambda: False)
+    monkeypatch.setattr(__main__, "Menu", ExitMenu)
+    for name in ["echo", "nocbreak", "endwin"]:
+        monkeypatch.setattr(__main__.curses, name, lambda: None)
+    try:
+        with contextlib.suppress(KeyboardInterrupt):
+            __main__.start()
+        acquired = daemon_mod.acquire_lock()
+        try:
+            assert acquired is not None, "TUI left its real OS lock held"
+        finally:
+            daemon_mod.release_lock(acquired)
+    finally:
+        daemon_mod.release_lock(__main__._lock_fd)
+        __main__._lock_fd = None

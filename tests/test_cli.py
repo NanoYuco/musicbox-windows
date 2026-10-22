@@ -631,6 +631,7 @@ class FakeResponse:
     def __init__(self, ok=True):
         self.ok = ok
         self.status_code = 200 if ok else 403
+        self.headers = {"Content-Type": "audio/mpeg"}
 
     def raise_for_status(self):
         if not self.ok:

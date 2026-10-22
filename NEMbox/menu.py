@@ -19,7 +19,6 @@ import time
 import webbrowser
 from collections import namedtuple
 from copy import deepcopy
-from threading import Timer
 from typing import Any, cast
 
 from rapidfuzz import process
@@ -163,12 +162,12 @@ class Menu:
         self.collection: list[Any] = cast(
             list[Any], self.storage.database["collections"]
         )
-        self.player = Player()
+        self.ui = Ui()
+        self.player = Player(ui=self.ui)
         self.player.playing_song_changed_callback = self.song_changed_callback
         self.cache = Cache()
-        self.ui = Ui()
         self.api = NetEase()
-        self.screen = C.initscr()
+        self.screen = self.ui.screen
         self.screen.keypad(True)
         self.step = cast(int, Config().get("page_length"))
         if self.step == 0:
@@ -177,18 +176,30 @@ class Menu:
         self.djstack: list[Any] = []
         self.at_playing_list = False
         self.enter_flag = True
-        signal.signal(signal.SIGWINCH, self.change_term)
+        if os.name != "nt":
+            signal.signal(signal.SIGWINCH, self.change_term)
         signal.signal(signal.SIGINT, self.send_kill)
         signal.signal(signal.SIGTERM, self.send_kill)
         self.menu_starts = time.time()
         self.countdown_start = time.time()
         self.countdown = -1
         self.is_in_countdown = False
-        self.timer: Timer | None = None
         self.key_list: list[int] = []
         self.pre_keylist: list[int] = []
         self.parser: Any = None
         self.at_search_result = False
+        self._pending_song_changed = threading.Event()
+        self._pending_fm = threading.Event()
+        self.ui.should_exit = self._exit_requested
+
+    def _exit_requested(self):
+        if (
+            self.is_in_countdown
+            and time.monotonic() - self.countdown_start >= self.countdown
+        ):
+            self.is_in_countdown = False
+            self.quit = True
+        return self.quit
 
     @property
     def user(self):
@@ -228,7 +239,10 @@ class Menu:
         last_code = None
         self.ui.screen.nodelay(True)
         try:
-            while time.time() < deadline:
+            while time.time() < deadline and not self._exit_requested():
+                if self.ui.screen.getmaxyx() != (self.ui.y, self.ui.x):
+                    self.ui.update_size()
+                    status_row = self.ui.build_login_qr(url)
                 resp = self.api.login_qr_check(unikey)
                 code = resp.get("code")
                 if code == 803:
@@ -243,7 +257,7 @@ class Menu:
                     last_code = code
                 # 等待约 2 秒，期间允许用户按 Q/ESC 取消
                 wait_until = time.time() + 2
-                while time.time() < wait_until:
+                while time.time() < wait_until and not self._exit_requested():
                     ch = self.ui.screen.getch()
                     if ch in (ord("q"), ord("Q"), 27):
                         return False
@@ -252,13 +266,15 @@ class Menu:
             self.ui.screen.nodelay(False)
             self.ui.screen.timeout(100)
 
-        return self._login_retry()
+        return False if self._exit_requested() else self._login_retry()
 
     def _on_qr_login_success(self):
         info = self.api.get_account_info()
         account = info.get("account") or {}
         profile = info.get("profile") or {}
         userid = account.get("id")
+        if not userid:
+            return False
         nickname = profile.get("nickname") or ""
         self.storage.login(nickname, "", userid, nickname)
         return True
@@ -321,15 +337,10 @@ class Menu:
         self.ui.screen.refresh()
 
     def send_kill(self, signum, fram):
-        stop_lyrics_process()
-        self.player.stop()
-        self.cache.quit()
-        self.storage.save()
-        C.endwin()
-        sys.exit()
+        self.quit = True
 
     def update_alert(self, version):
-        latest = Menu().check_version()
+        latest = self.check_version()
         if str(latest) > str(version) and latest != 0:
             notify("MusicBox Update == available", 1)
             time.sleep(0.5)
@@ -350,11 +361,17 @@ class Menu:
             return 0
 
     def start_fork(self, version):
+        if os.name == "nt":
+            threading.Thread(
+                target=self.update_alert, args=(version,), daemon=True
+            ).start()
+            self.start()
+            return
         pid = os.fork()
         if pid == 0:
-            Menu().update_alert(version)
+            self.update_alert(version)
         else:
-            Menu().start()
+            self.start()
 
     def next_song(self):
         if self.player.is_empty:
@@ -566,23 +583,26 @@ class Menu:
             self.ui.screen.refresh()
 
     def time_key_event(self):
-        self.countdown_start = time.time()
         countdown = self.ui.build_timing()
-        if not countdown.isdigit():
+        if not countdown or not countdown.isascii() or not countdown.isdecimal():
+            if countdown:
+                notify("The input should be digit")
+            self.build_menu_processbar()
+            return
+        try:
+            countdown = int(countdown)
+        except ValueError:
             notify("The input should be digit")
-
-        countdown = int(countdown)
+            self.build_menu_processbar()
+            return
         if countdown > 0:
             notify(f"The musicbox will exit in {countdown} minutes")
             self.countdown = countdown * 60
+            self.countdown_start = time.monotonic()
             self.is_in_countdown = True
-            self.timer = Timer(self.countdown, self.stop, ())
-            self.timer.start()
         else:
             notify("The timing exit has been canceled")
             self.is_in_countdown = False
-            if self.timer:
-                self.timer.cancel()
         self.build_menu_processbar()
 
     def down_page_event(self):
@@ -612,13 +632,40 @@ class Menu:
         self.player.update_size()
 
     def build_menu_processbar(self):
+        self.ui.update_size()
+        available = max(1, self.ui.y - 10)
+        requested = self.config.get("page_length") or max(
+            int(self.ui.y * 4 / 5) - 10, 1
+        )
+        self.step = min(requested, available)
+        self.index = min(max(0, self.index), max(0, len(self.datalist) - 1))
+        self.offset = self.index // self.step * self.step
+        if self._pending_song_changed.is_set():
+            self._pending_song_changed.clear()
+            self.song_changed_callback()
+        if self._pending_fm.is_set():
+            self._pending_fm.clear()
+            self.fm_callback()
+        self.player.build_playinfo()
         self.ui.build_process_bar(
-            self.player.current_song,
+            self.player.current_song
+            if self.player.playback_state not in {"stopped", "error"}
+            else {},
             self.player.process_location,
             self.player.process_length,
             self.player.playing_flag,
             self.player.info["playing_mode"],
         )
+        if self.player.playback_error:
+            self.ui.addstr(6, 0, self.player.playback_error["message"], C.color_pair(3))
+        elif self.player.playback_state in {"loading", "buffering"}:
+            self.ui.addstr(
+                6,
+                0,
+                "正在加载..."
+                if self.player.playback_state == "loading"
+                else "缓冲中...",
+            )
         self.ui.build_menu(
             self.datatype,
             self.title,
@@ -634,11 +681,15 @@ class Menu:
         sys.exit(0)
 
     def stop(self):
+        if getattr(self, "_stopped", False):
+            return
+        self._stopped = True
         self.quit = True
+        self.is_in_countdown = False
+        stop_lyrics_process()
         self.player.stop()
         self.cache.quit()
         self.storage.save()
-        C.endwin()
 
     def start(self):
         self.menu_starts = time.time()
@@ -662,7 +713,7 @@ class Menu:
         erase_coro = erase_coroutine(erase_cmd_list)
         next(self.parser)  # start generator
         next(erase_coro)
-        while not self.quit:
+        while not self._exit_requested():
             datatype = self.datatype
             title = self.title
             datalist = self.datalist
@@ -671,6 +722,11 @@ class Menu:
             step = self.step
             self.screen.timeout(self.config.get("input_timeout"))
             key = self.screen.getch()
+            if self._exit_requested():
+                break
+            if self.ui._small_window() and key != ord(KEY_MAP["quit"]):
+                self.build_menu_processbar()
+                continue
 
             if (
                 key in COMMAND_LIST
@@ -726,9 +782,8 @@ class Menu:
                 self.num_jump_key_event()
                 self.key_list.clear()
                 continue
-            # if self.is_in_countdown:
-            #     if time.time() - self.countdown_start > self.countdown:
-            #         break
+            if self._exit_requested():
+                break
             if key == -1:
                 self.player.update_size()
 
@@ -1051,10 +1106,6 @@ class Menu:
             pre_key = key
             self.ui.screen.refresh()
             self.ui.update_size()
-            current_step = max(int(self.ui.y * 4 / 5) - 10, 1)
-            if self.step != current_step and self.config.get("page_length") == 0:
-                self.step = current_step
-                self.index = 0
             self.build_menu_processbar()
         self.stop()
 
@@ -1227,10 +1278,16 @@ class Menu:
         self.offset = self.index // self.step * self.step
 
     def song_changed_callback(self):
+        if threading.current_thread() is not threading.main_thread():
+            self._pending_song_changed.set()
+            return
         if self.at_playing_list:
             self.show_playing_song()
 
     def fm_callback(self):
+        if threading.current_thread() is not threading.main_thread():
+            self._pending_fm.set()
+            return
         # log.debug('FM CallBack.')
         data = self.get_new_fm()
         self.player.append_songs(data)
@@ -1255,10 +1312,20 @@ class Menu:
         # 已登录时，空列表是合法返回值，不应触发重新登录导致用户被下线
         if isinstance(result, list) and self.account:
             return result
-        if not self.login():
+        if not self._ensure_login():
             notify("You need to log in")
             return False
         return func(*args)
+
+    def _ensure_login(self):
+        info = self.api.get_account_info()
+        account = info.get("account") or {}
+        profile = info.get("profile") or {}
+        if account.get("id"):
+            nickname = profile.get("nickname") or ""
+            self.storage.login(nickname, "", account["id"], nickname)
+            return True
+        return self.login()
 
     def get_new_fm(self):
         data = self.request_api(self.api.personal_fm)
@@ -1300,14 +1367,14 @@ class Menu:
             self.title += " > 精选歌单"
             self.datatype = "recommend_lists"
         elif idx == 4:
-            if not self.account:
-                self.login()
+            if not self._ensure_login():
+                return
             myplaylist = self.request_api(self.api.user_playlist, self.userid)
             self.datatype = "top_playlists"
             self.datalist = self.api.dig_info(myplaylist, self.datatype)
             self.title += " > " + self.username + " 的歌单"
         elif idx == 5:
-            if not self.account and not self.login():
+            if not self._ensure_login():
                 return
             cloud_songs = self.request_api(self.api.user_cloud)
             self.datatype = "songs"
@@ -1318,7 +1385,7 @@ class Menu:
             self.title += " > 主播电台"
             self.datalist = self.api.djRadios()
         elif idx == 7:
-            if not self.account and not self.login():
+            if not self._ensure_login():
                 return
             self.datatype = "songs"
             self.title += " > 每日推荐歌曲"
@@ -1327,7 +1394,7 @@ class Menu:
                 return
             self.datalist = self.api.dig_info(myplaylist, self.datatype)
         elif idx == 8:
-            if not self.account and not self.login():
+            if not self._ensure_login():
                 return
             myplaylist = self.request_api(self.api.recommend_resource)
             self.datatype = "top_playlists"

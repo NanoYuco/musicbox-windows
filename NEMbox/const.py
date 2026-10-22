@@ -1,5 +1,10 @@
 # KenHuang: 使配置文件夹符合XDG标准
 import os
+import tempfile
+
+if os.name == "nt":
+    import getpass
+    import hashlib
 
 
 class Constant:
@@ -29,10 +34,22 @@ class Constant:
         log_path = os.path.join(conf_dir, "musicbox.log")
         storage_path = os.path.join(conf_dir, "database.json")
 
-    # Runtime dir for the daemon's Unix domain socket + single-owner lock.
-    # Follows the XDG_RUNTIME_DIR convention, falling back to the system tmp dir.
-    _runtime_base = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"  # noqa: S108
+    # Runtime discovery and the single-owner lock. Keep POSIX's existing /tmp
+    # fallback; Windows defaults to a user-writable local application directory.
+    _runtime_base = os.environ.get("XDG_RUNTIME_DIR") or (
+        os.environ.get("LOCALAPPDATA", tempfile.gettempdir())
+        if os.name == "nt"
+        else "/tmp"  # noqa: S108
+    )
     runtime_dir = os.path.join(_runtime_base, "netease-musicbox")
-    _uid = os.getuid() if hasattr(os, "getuid") else 0
+    _uid = (
+        hashlib.sha256(
+            (
+                getpass.getuser() + "\0" + os.path.normcase(os.path.abspath(conf_dir))
+            ).encode("utf-8")
+        ).hexdigest()[:24]
+        if os.name == "nt"
+        else os.getuid()
+    )
     socket_path = os.path.join(runtime_dir, f"musicboxd-{_uid}.sock")
     lock_path = os.path.join(runtime_dir, f"musicboxd-{_uid}.lock")

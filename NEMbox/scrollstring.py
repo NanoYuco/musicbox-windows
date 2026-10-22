@@ -1,5 +1,27 @@
 #!/usr/bin/python
+import unicodedata
 from time import time
+
+
+def _units(text):
+    """Keep a base character and its combining marks together when scrolling."""
+    units = []
+    for char in text:
+        regional = 0x1F1E6 <= ord(char) <= 0x1F1FF
+        if units and (
+            unicodedata.combining(char)
+            or unicodedata.category(char) in {"Mn", "Me", "Cf"}
+            or units[-1].endswith("\u200d")
+            or (
+                regional
+                and len(units[-1]) == 1
+                and 0x1F1E6 <= ord(units[-1]) <= 0x1F1FF
+            )
+        ):
+            units[-1] += char
+        else:
+            units.append(char)
+    return units
 
 
 class scrollstring:
@@ -10,16 +32,13 @@ class scrollstring:
         self.update()
 
     def update(self):
-        self.display = self.content
+        units = _units(self.content)
+        if not units:
+            self.display = ""
+            return
         curTime = time() // 1
-        offset = max(int((curTime - self.START) % len(self.content)) - 1, 0)
-        while offset > 0:
-            if self.display[0] > chr(127):
-                offset -= 1
-                self.display = self.display[1:] + self.display[:1]
-            else:
-                offset -= 1
-                self.display = self.display[2:] + self.display[:2]
+        offset = max(int((curTime - self.START) % len(units)) - 1, 0)
+        self.display = "".join(units[offset:] + units[:offset])
 
         # self.display = self.content[offset:] + self.content[:offset]
 
@@ -45,13 +64,31 @@ def truelen(string):
     >>> truelen('')
     0
     """
-    return len(string) + sum(1 for c in string if c > chr(127))
+    total = 0
+    for unit in _units(string):
+        widths = [
+            0
+            if unicodedata.category(c) in {"Mn", "Me", "Cf"}
+            else 2
+            if unicodedata.east_asian_width(c) in {"W", "F"}
+            else 1
+            for c in unit
+        ]
+        if "\ufe0f" in unit or (
+            len(unit) == 2 and all(0x1F1E6 <= ord(c) <= 0x1F1FF for c in unit)
+        ):
+            total += 2
+        else:
+            total += max(widths, default=0)
+    return total
 
 
 def truelen_cut(string, length):
     current_length = 0
-    for current_pos, c in enumerate(string):
-        current_length += 2 if c > chr(127) else 1
+    result = []
+    for unit in _units(string):
+        current_length += truelen(unit)
         if current_length > length:
-            return string[:current_pos]
-    return string
+            break
+        result.append(unit)
+    return "".join(result)

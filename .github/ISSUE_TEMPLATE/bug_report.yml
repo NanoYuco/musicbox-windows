@@ -6,9 +6,9 @@ body:
   - type: markdown
     attributes:
       value: |
-        提交前请先阅读 [README 排错说明](https://github.com/darknessomi/musicbox#排错)，并确认已用最新版本复现。
+        提交前请先阅读本仓库根目录 README.md 的“常见问题”和 CHANGELOG.md，并确认已用本仓库当前 Windows 源码复现。
 
-        **请勿**在 Issue 中粘贴 Cookie、扫码登录输出或完整日志中的敏感信息。
+        **请勿**在 Issue 中粘贴 Cookie、扫码登录输出或完整日志中的敏感信息。安全问题请先阅读本仓库根目录 SECURITY.md。
 
   - type: textarea
     id: description
@@ -47,7 +47,7 @@ body:
     id: version
     attributes:
       label: MusicBox 版本
-      description: 运行 `musicbox --version` 的输出
+      description: 在源码目录运行 `uv run musicbox --version` 的输出，并注明源码 commit（如有）
       placeholder: "0.5.3"
     validations:
       required: true
@@ -56,7 +56,7 @@ body:
     id: os
     attributes:
       label: 操作系统
-      placeholder: "macOS 15 / Ubuntu 24.04 / Raspberry Pi OS"
+      placeholder: "Windows 11 x64，并注明终端类型"
     validations:
       required: true
 
@@ -64,7 +64,7 @@ body:
     id: python
     attributes:
       label: Python 版本
-      description: 运行 `python3 --version` 的输出
+      description: 运行 `uv run python --version` 的输出
       placeholder: "Python 3.12.x"
     validations:
       required: false
@@ -87,8 +87,7 @@ body:
     attributes:
       label: 安装方式
       options:
-        - PyPI / pipx / uv tool install
-        - 源码安装（uv sync / uv tool install .）
+        - 本仓库源码安装（uv sync --frozen）
         - 其他 / 不确定
     validations:
       required: false
@@ -109,8 +108,8 @@ body:
     attributes:
       label: 相关日志
       description: |
-        可从 `~/.local/share/netease-musicbox/musicbox.log` 提取相关片段（请脱敏）。
-        未设置 `XDG_DATA_HOME` 时路径为 `~/.netease-musicbox/musicbox.log`。
+        未设置 XDG_DATA_HOME 时，可从 `%USERPROFILE%\.netease-musicbox\musicbox.log` 提取相关片段（请脱敏）。
+        设置后路径为 `%XDG_DATA_HOME%\netease-musicbox\musicbox.log`。
       render: shell
     validations:
       required: false
